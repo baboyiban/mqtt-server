@@ -17,9 +17,22 @@ func main() {
 	log.Println("Redis 연결 성공")
 
 	b := broker.NewBroker(store)
-	if err := b.ListenAndServe(":1883"); err != nil {
-		log.Fatalf("MQTT 서버 종료: %v", err)
-	}
+
+	// TCP 1883
+	go func() {
+		if err := b.ListenAndServe(":1883"); err != nil {
+			log.Fatalf("MQTT 서버 종료: %v", err)
+		}
+	}()
+
+	// WebSocket 8083
+	go func() {
+		if err := b.ListenAndServeWS(":8083"); err != nil {
+			log.Fatalf("MQTT WS 서버 종료: %v", err)
+		}
+	}()
+
+	select {} // forever
 }
 
 func getEnv(key, fallback string) string {

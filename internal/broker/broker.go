@@ -3,21 +3,23 @@ package broker
 import (
 	"log"
 	"net"
+	"net/http"
 	"sync"
 
 	"github.com/baboyiban/mqtt-server/internal/storage"
+	"github.com/gorilla/websocket"
 )
 
 type Broker struct {
 	store   storage.Store
-	clients map[string]*Client
+	clients map[string]Clienter
 	mu      sync.RWMutex
 }
 
 func NewBroker(store storage.Store) *Broker {
 	return &Broker{
 		store:   store,
-		clients: make(map[string]*Client),
+		clients: make(map[string]Clienter),
 	}
 }
 
@@ -39,7 +41,27 @@ func (b *Broker) ListenAndServe(addr string) error {
 	}
 }
 
+var upgrader = websocket.Upgrader{}
+
+func (b *Broker) ListenAndServeWS(addr string) error {
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		wsConn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			log.Println("WebSocket 업그레이드 실패:", err)
+			return
+		}
+		go b.handleWSClient(wsConn)
+	})
+	log.Printf("MQTT WebSocket 서버 시작: %s", addr)
+	return http.ListenAndServe(addr, nil)
+}
+
 func (b *Broker) handleClient(conn net.Conn) {
 	client := NewClient(conn, b)
+	client.Handle()
+}
+
+func (b *Broker) handleWSClient(wsConn *websocket.Conn) {
+	client := NewWSClient(wsConn, b)
 	client.Handle()
 }

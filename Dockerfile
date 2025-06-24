@@ -10,6 +10,6 @@ FROM alpine:latest
 
 WORKDIR /app
 COPY --from=builder /app/mqtt-server .
-EXPOSE 1883
+EXPOSE 1883 8083
 
 CMD ["./mqtt-server"]

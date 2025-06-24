@@ -3,6 +3,7 @@ services:
     build: .
     ports:
       - "${MQTT_PORT:-1883}:1883"
+      - "8083:8083"
     depends_on:
       - redis
     environment:
