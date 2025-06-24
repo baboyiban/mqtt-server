@@ -11,8 +11,17 @@ const (
 	PacketTypePUBLISH    = 3
 	PacketTypeSUBSCRIBE  = 8
 	PacketTypeSUBACK     = 9
+	PacketTypePINGREQ    = 12 // Add this
+	PacketTypePINGRESP   = 13 // Add this
 	PacketTypeDISCONNECT = 14
 )
+
+// Add a function to write PINGRESP
+func WritePingrespPacket(w io.Writer) error {
+	packet := []byte{0xD0, 0x00} // PINGRESP packet is type 13 (D0) with no payload (length 0)
+	_, err := w.Write(packet)
+	return err
+}
 
 type PacketHeader struct {
 	Type   byte

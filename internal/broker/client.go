@@ -76,6 +76,7 @@ func (c *Client) Handle() {
 			_ = mqtt.WriteSubackPacket(c.conn, subPkt.PacketID)
 
 		case mqtt.PacketTypePUBLISH:
+			log.Printf("====== PUBLISH 패킷 수신 ======")
 			pubPkt, err := mqtt.ParsePublishPacket(c.conn, header.RemLen)
 			if err != nil {
 				log.Printf("PUBLISH 패킷 파싱 실패: %v", err)
@@ -83,6 +84,12 @@ func (c *Client) Handle() {
 			}
 			log.Printf("메시지 발행: [%s] %s", pubPkt.Topic, string(pubPkt.Payload))
 			subs := c.broker.store.GetSubscribers(pubPkt.Topic)
+			log.Printf("구독자 목록 [%s]: %v", pubPkt.Topic, subs)
+
+			if len(subs) == 0 {
+				log.Printf("경고: 토픽 %s에 구독자가 없습니다", pubPkt.Topic)
+			}
+
 			for _, subID := range subs {
 				if subID == clientID {
 					continue // 자기 자신에게는 보내지 않음
@@ -91,9 +98,17 @@ func (c *Client) Handle() {
 				subClient, ok := c.broker.clients[subID]
 				c.broker.mu.RUnlock()
 				if ok {
+					log.Printf("메시지 전달: %s → %s (%s)", clientID, subID, pubPkt.Topic)
 					subClient.SendPublish(pubPkt.Topic, pubPkt.Payload)
+				} else {
+					log.Printf("경고: 구독자 %s를 찾을 수 없습니다", subID)
 				}
 			}
+
+		case mqtt.PacketTypePINGREQ:
+			log.Printf("PINGREQ 수신: %s", clientID)
+			_ = mqtt.WritePingrespPacket(c.conn)
+			log.Printf("PINGRESP 전송: %s", clientID)
 
 		case mqtt.PacketTypeDISCONNECT:
 			log.Printf("클라이언트 %s DISCONNECT", clientID)
@@ -141,18 +156,48 @@ func (c *WSClient) Handle() {
 	defer c.conn.Close()
 	var clientID string
 
+	log.Printf("WebSocket 클라이언트 처리 시작: %s", c.conn.RemoteAddr())
+
 	for {
-		_, data, err := c.conn.ReadMessage()
+		messageType, data, err := c.conn.ReadMessage()
 		if err != nil {
 			log.Printf("WebSocket 읽기 실패: %v", err)
 			break
 		}
+
+		// Log message type and data length
+		log.Printf("WebSocket 메시지 수신: 타입=%d, 길이=%d", messageType, len(data))
+
+		// For very small packets, log the raw bytes to help debugging
+		if len(data) < 10 {
+			log.Printf("WebSocket 원시 데이터: %v", data)
+		}
+
+		// Only process binary messages
+		if messageType != websocket.BinaryMessage {
+			log.Printf("WebSocket 경고: 바이너리가 아닌 메시지 수신 (타입: %d)", messageType)
+			// For text messages, send a helpful response
+			if messageType == websocket.TextMessage && len(data) > 0 {
+				log.Printf("텍스트 메시지 내용: %s", string(data))
+				_ = c.conn.WriteMessage(websocket.TextMessage, []byte("MQTT over WebSocket requires binary frames"))
+			}
+			continue // Skip further processing of this message
+		}
+
+		// Skip empty messages
+		if len(data) == 0 {
+			log.Printf("WebSocket 경고: 빈 메시지 수신")
+			continue
+		}
+
 		r := bytes.NewReader(data)
 		header, err := mqtt.ReadPacketHeader(r)
 		if err != nil {
-			log.Printf("패킷 헤더 읽기 실패: %v", err)
+			log.Printf("패킷 헤더 읽기 실패: %v, 데이터 길이: %d", err, len(data))
 			break
 		}
+
+		log.Printf("MQTT 패킷 타입: %d, 길이: %d", header.Type, header.RemLen)
 
 		switch header.Type {
 		case mqtt.PacketTypeCONNECT:
@@ -202,6 +247,13 @@ func (c *WSClient) Handle() {
 					subClient.SendPublish(pubPkt.Topic, pubPkt.Payload)
 				}
 			}
+
+		case mqtt.PacketTypePINGREQ:
+			log.Printf("WS PINGREQ 수신: %s", clientID)
+			var buf bytes.Buffer
+			_ = mqtt.WritePingrespPacket(&buf)
+			_ = c.conn.WriteMessage(websocket.BinaryMessage, buf.Bytes())
+			log.Printf("WS PINGRESP 전송: %s", clientID)
 
 		case mqtt.PacketTypeDISCONNECT:
 			log.Printf("WS 클라이언트 %s DISCONNECT", clientID)

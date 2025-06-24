@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"log"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -29,10 +30,13 @@ func (r *RedisStore) AddSubscriber(topic, clientID string) error {
 }
 
 func (r *RedisStore) GetSubscribers(topic string) []string {
-	subs, err := r.client.SMembers(r.ctx, "subscribers:"+topic).Result()
+	key := "subscribers:" + topic
+	subs, err := r.client.SMembers(r.ctx, key).Result()
 	if err != nil {
+		log.Printf("Redis 구독자 조회 실패: %v", err)
 		return nil
 	}
+	log.Printf("Redis 구독자 조회 [%s]: %v", key, subs)
 	return subs
 }
 
