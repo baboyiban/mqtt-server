@@ -19,9 +19,10 @@ type Clienter interface {
 // --- TCP 클라이언트 ---
 
 type Client struct {
-	conn   net.Conn
-	broker *Broker
-	id     string
+	conn             net.Conn
+	broker           *Broker
+	id               string
+	subscribedTopics []string
 }
 
 func NewClient(conn net.Conn, broker *Broker) *Client {
@@ -72,6 +73,7 @@ func (c *Client) Handle() {
 				return
 			}
 			c.broker.store.AddSubscriber(subPkt.Topic, clientID)
+			c.subscribedTopics = append(c.subscribedTopics, subPkt.Topic) // 추가
 			log.Printf("구독: %s → %s", clientID, subPkt.Topic)
 			_ = mqtt.WriteSubackPacket(c.conn, subPkt.PacketID)
 
@@ -124,15 +126,20 @@ func (c *Client) Handle() {
 		c.broker.mu.Lock()
 		delete(c.broker.clients, clientID)
 		c.broker.mu.Unlock()
+		// 구독자 리스트에서 제거
+		for _, topic := range c.subscribedTopics {
+			c.broker.store.RemoveSubscriber(topic, clientID)
+		}
 	}
 }
 
 // --- WebSocket 클라이언트 ---
 
 type WSClient struct {
-	conn   *websocket.Conn
-	broker *Broker
-	id     string
+	conn             *websocket.Conn
+	broker           *Broker
+	id               string
+	subscribedTopics []string
 }
 
 func NewWSClient(conn *websocket.Conn, broker *Broker) *WSClient {
@@ -223,6 +230,7 @@ func (c *WSClient) Handle() {
 				return
 			}
 			c.broker.store.AddSubscriber(subPkt.Topic, clientID)
+			c.subscribedTopics = append(c.subscribedTopics, subPkt.Topic)
 			log.Printf("WS 구독: %s → %s", clientID, subPkt.Topic)
 			var buf bytes.Buffer
 			_ = mqtt.WriteSubackPacket(&buf, subPkt.PacketID)
@@ -269,5 +277,9 @@ func (c *WSClient) Handle() {
 		c.broker.mu.Lock()
 		delete(c.broker.clients, clientID)
 		c.broker.mu.Unlock()
+		// 구독자 리스트에서 제거
+		for _, topic := range c.subscribedTopics {
+			c.broker.store.RemoveSubscriber(topic, clientID)
+		}
 	}
 }

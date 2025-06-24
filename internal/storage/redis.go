@@ -11,6 +11,7 @@ type Store interface {
 	AddSubscriber(topic, clientID string) error
 	GetSubscribers(topic string) []string
 	Ping() error
+	RemoveSubscriber(topic, clientID string) error
 }
 
 type RedisStore struct {
@@ -42,4 +43,8 @@ func (r *RedisStore) GetSubscribers(topic string) []string {
 
 func (r *RedisStore) Ping() error {
 	return r.client.Ping(r.ctx).Err()
+}
+
+func (r *RedisStore) RemoveSubscriber(topic, clientID string) error {
+	return r.client.SRem(r.ctx, "subscribers:"+topic, clientID).Err()
 }

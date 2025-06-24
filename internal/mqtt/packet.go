@@ -164,7 +164,9 @@ func ParsePublishPacket(r io.Reader, remLen int) (*PublishPacket, error) {
 func WritePublishPacket(w io.Writer, topic string, payload []byte) error {
 	topicLen := len(topic)
 	remLen := 2 + topicLen + len(payload)
-	packet := []byte{0x30, byte(remLen), byte(topicLen >> 8), byte(topicLen & 0xFF)}
+	packet := []byte{0x30}
+	packet = append(packet, encodeRemainingLength(remLen)...)
+	packet = append(packet, byte(topicLen>>8), byte(topicLen&0xFF))
 	packet = append(packet, []byte(topic)...)
 	packet = append(packet, payload...)
 	_, err := w.Write(packet)
@@ -176,4 +178,21 @@ func WriteConnackPacket(w io.Writer) error {
 	packet := []byte{0x20, 0x02, 0x00, 0x00}
 	_, err := w.Write(packet)
 	return err
+}
+
+// MQTT Remaining Length 가변 길이 인코딩
+func encodeRemainingLength(remLen int) []byte {
+	var encoded []byte
+	for {
+		enc := remLen % 128
+		remLen /= 128
+		if remLen > 0 {
+			enc |= 128
+		}
+		encoded = append(encoded, byte(enc))
+		if remLen == 0 {
+			break
+		}
+	}
+	return encoded
 }
