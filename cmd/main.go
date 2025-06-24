@@ -18,21 +18,21 @@ func main() {
 
 	b := broker.NewBroker(store)
 
-	// TCP 1883
+	// 평문 TCP 1883
 	go func() {
 		if err := b.ListenAndServe(":1883"); err != nil {
 			log.Fatalf("MQTT 서버 종료: %v", err)
 		}
 	}()
 
-	// WebSocket 8083
+	// 평문 WS 8083
 	go func() {
 		if err := b.ListenAndServeWS(":8083"); err != nil {
 			log.Fatalf("MQTT WS 서버 종료: %v", err)
 		}
 	}()
 
-	select {} // forever
+	select {}
 }
 
 func getEnv(key, fallback string) string {

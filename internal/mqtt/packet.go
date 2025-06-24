@@ -69,14 +69,24 @@ func ParseConnectPacket(r io.Reader, remLen int) (*ConnectPacket, error) {
 	if _, err := io.ReadFull(r, buf); err != nil {
 		return nil, err
 	}
-	if len(buf) < 12 {
+	if len(buf) < 10 {
 		return nil, errors.New("CONNECT 패킷이 너무 짧음")
 	}
-	clientIDLen := int(buf[10])<<8 | int(buf[11])
-	if len(buf) < 12+clientIDLen {
+	// 프로토콜 이름 길이
+	protoNameLen := int(buf[0])<<8 | int(buf[1])
+	if len(buf) < 2+protoNameLen+4 {
+		return nil, errors.New("CONNECT 패킷이 너무 짧음(프로토콜 이름)")
+	}
+	// ClientID 위치 계산
+	pos := 2 + protoNameLen + 1 + 1 + 2 // protoName + version + flags + keepalive
+	if len(buf) < pos+2 {
+		return nil, errors.New("CONNECT 패킷이 너무 짧음(ClientID 길이)")
+	}
+	clientIDLen := int(buf[pos])<<8 | int(buf[pos+1])
+	if len(buf) < pos+2+clientIDLen {
 		return nil, errors.New("ClientID 길이 오류")
 	}
-	clientID := string(buf[12 : 12+clientIDLen])
+	clientID := string(buf[pos+2 : pos+2+clientIDLen])
 	return &ConnectPacket{ClientID: clientID}, nil
 }
 
