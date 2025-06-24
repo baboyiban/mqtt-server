@@ -1,0 +1,19 @@
+services:
+  mqtt-server:
+    build: .
+    ports:
+      - "${MQTT_PORT:-1883}:1883"
+    depends_on:
+      - redis
+    environment:
+      - REDIS_ADDR=${REDIS_ADDR:-redis:6379}
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+
+volumes:
+  redis-data:
