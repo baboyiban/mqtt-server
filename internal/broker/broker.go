@@ -29,24 +29,17 @@ func (b *Broker) ListenAndServe(addr string) error {
 		return err
 	}
 	defer ln.Close()
-	log.Printf("MQTT 서버 시작: %s", addr)
+	log.Printf("[서버] MQTT TCP 서버 시작: addr=%s", addr)
 
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			log.Printf("클라이언트 연결 실패: %v", err)
+			log.Printf("[서버] TCP 연결 실패: addr=%s, err=%v", conn.RemoteAddr(), err)
 			continue
 		}
+		log.Printf("[서버] TCP 연결 수락: addr=%s", conn.RemoteAddr())
 		go b.handleClient(conn)
 	}
-}
-
-var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool {
-		log.Printf("WebSocket Origin: %s", r.Header.Get("Origin"))
-		return true
-	},
-	Subprotocols: []string{"mqtt", "mqttv3.1"},
 }
 
 func (b *Broker) ListenAndServeWS(addr string) error {
@@ -62,21 +55,24 @@ func (b *Broker) ListenAndServeWS(addr string) error {
 			return
 		}
 
-		// Log requested subprotocols
-		if len(r.Header["Sec-Websocket-Protocol"]) > 0 {
-			log.Printf("Client requested subprotocols: %v", r.Header["Sec-Websocket-Protocol"])
-		}
-
 		wsConn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
-			log.Println("WebSocket 업그레이드 실패:", err)
+			log.Printf("[서버] WebSocket 업그레이드 실패: addr=%s, err=%v", r.RemoteAddr, err)
 			return
 		}
-		log.Printf("WebSocket 연결 성공: %s", wsConn.RemoteAddr())
+		log.Printf("[서버] WebSocket 연결 수락: addr=%s", wsConn.RemoteAddr())
 		go b.handleWSClient(wsConn)
 	})
-	log.Printf("MQTT WebSocket 서버 시작: %s", addr)
+	log.Printf("[서버] MQTT WebSocket 서버 시작: addr=%s", addr)
 	return http.ListenAndServe(addr, nil)
+}
+
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool {
+		log.Printf("WebSocket Origin: %s", r.Header.Get("Origin"))
+		return true
+	},
+	Subprotocols: []string{"mqtt", "mqttv3.1"},
 }
 
 func (b *Broker) handleClient(conn net.Conn) {
