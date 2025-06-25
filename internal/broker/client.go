@@ -71,7 +71,8 @@ func (c *Client) Handle() {
 
 			// 빈 ID 클라이언트에게 고유 ID 부여
 			if clientID == "" {
-				clientID = fmt.Sprintf("auto-%s-%d", c.conn.RemoteAddr(), time.Now().UnixNano())
+				// 현재 시간 기반 해시 (6자리 16진수)
+				clientID = fmt.Sprintf("auto-%x", time.Now().UnixNano()%0xFFFFFF)
 				log.Printf("[TCP] 빈 ID 클라이언트에게 자동 ID 부여: id=%s", clientID)
 			}
 
@@ -237,7 +238,8 @@ func (c *WSClient) Handle() {
 
 			// 빈 ID 클라이언트에게 고유 ID 부여
 			if clientID == "" {
-				clientID = fmt.Sprintf("auto-%s-%d", c.conn.RemoteAddr(), time.Now().UnixNano())
+				// 현재 시간 기반 해시 (6자리 16진수)
+				clientID = fmt.Sprintf("auto-%x", time.Now().UnixNano()%0xFFFFFF)
 				log.Printf("[TCP] 빈 ID 클라이언트에게 자동 ID 부여: id=%s", clientID)
 			}
 
