@@ -2,8 +2,10 @@ package broker
 
 import (
 	"bytes"
+	"fmt"
 	"log"
 	"net"
+	"time"
 
 	"github.com/baboyiban/mqtt-server/internal/mqtt"
 	"github.com/gorilla/websocket"
@@ -36,11 +38,11 @@ func (c *Client) GetID() string {
 	return c.id
 }
 
+// Client.SendPublish 메서드 변경
 func (c *Client) SendPublish(topic string, payload []byte) bool {
 	err := mqtt.WritePublishPacket(c.conn, topic, payload)
 	if err != nil {
 		log.Printf("[TCP] 메시지 전송 실패: id=%s, topic=%s, err=%v", formatClientID(c.id), topic, err)
-		// 연결이 끊긴 것으로 판단
 		return false
 	}
 	return true
@@ -66,6 +68,13 @@ func (c *Client) Handle() {
 				return
 			}
 			clientID = connectPkt.ClientID
+
+			// 빈 ID 클라이언트에게 고유 ID 부여
+			if clientID == "" {
+				clientID = fmt.Sprintf("auto-%s-%d", c.conn.RemoteAddr(), time.Now().UnixNano())
+				log.Printf("[TCP] 빈 ID 클라이언트에게 자동 ID 부여: id=%s", clientID)
+			}
+
 			c.id = clientID
 			c.broker.mu.Lock()
 			c.broker.clients[clientID] = c
@@ -99,6 +108,7 @@ func (c *Client) Handle() {
 				log.Printf("[TCP] 구독자 없음: topic=%s", pubPkt.Topic)
 			}
 
+			// 메시지 전송 로직 개선
 			for _, subID := range subs {
 				c.broker.mu.RLock()
 				subClient, ok := c.broker.clients[subID]
@@ -110,7 +120,7 @@ func (c *Client) Handle() {
 
 					// 메시지 전송 시도하고 결과 확인
 					if !subClient.SendPublish(pubPkt.Topic, pubPkt.Payload) {
-						// 전송 실패 - 구독자 제거
+						// 전송 실패 - 해당 ID의 구독자만 제거
 						log.Printf("[TCP] 구독자 연결 끊김, 제거: id=%s, topic=%s", formatClientID(subID), pubPkt.Topic)
 						c.broker.mu.Lock()
 						delete(c.broker.clients, subID)
@@ -173,13 +183,13 @@ func (c *WSClient) SendPublish(topic string, payload []byte) bool {
 	var buf bytes.Buffer
 	err := mqtt.WritePublishPacket(&buf, topic, payload)
 	if err != nil {
+		log.Printf("[WS] 패킷 생성 실패: id=%s, topic=%s, err=%v", formatClientID(c.id), topic, err)
 		return false
 	}
 
 	err = c.conn.WriteMessage(websocket.BinaryMessage, buf.Bytes())
 	if err != nil {
 		log.Printf("[WS] 메시지 전송 실패: id=%s, topic=%s, err=%v", formatClientID(c.id), topic, err)
-		// 연결이 끊긴 것으로 판단
 		return false
 	}
 	return true
@@ -224,6 +234,13 @@ func (c *WSClient) Handle() {
 				return
 			}
 			clientID = connectPkt.ClientID
+
+			// 빈 ID 클라이언트에게 고유 ID 부여
+			if clientID == "" {
+				clientID = fmt.Sprintf("auto-%s-%d", c.conn.RemoteAddr(), time.Now().UnixNano())
+				log.Printf("[TCP] 빈 ID 클라이언트에게 자동 ID 부여: id=%s", clientID)
+			}
+
 			c.id = clientID
 			c.broker.mu.Lock()
 			c.broker.clients[clientID] = c
@@ -263,6 +280,7 @@ func (c *WSClient) Handle() {
 				log.Printf("[TCP] 구독자 없음: topic=%s", pubPkt.Topic)
 			}
 
+			// 메시지 전송 로직 개선
 			for _, subID := range subs {
 				c.broker.mu.RLock()
 				subClient, ok := c.broker.clients[subID]
@@ -274,7 +292,7 @@ func (c *WSClient) Handle() {
 
 					// 메시지 전송 시도하고 결과 확인
 					if !subClient.SendPublish(pubPkt.Topic, pubPkt.Payload) {
-						// 전송 실패 - 구독자 제거
+						// 전송 실패 - 해당 ID의 구독자만 제거
 						log.Printf("[TCP] 구독자 연결 끊김, 제거: id=%s, topic=%s", formatClientID(subID), pubPkt.Topic)
 						c.broker.mu.Lock()
 						delete(c.broker.clients, subID)
