@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -275,33 +276,50 @@ func (c *BaseClient) handleSubscribe(header *mqtt.PacketHeader, clientID string)
 		return false
 	}
 
-	topic := subPkt.Topic
-	c.saveSubscription(topic, clientID)
-	c.subscribedTopics = append(c.subscribedTopics, topic)
-	log.Printf("[%s] SUBSCRIBE: id=%s, topic=%s", c.transport.Type(), formatClientID(clientID), topic)
+	returnCodes := []byte{}
+	for _, sub := range subPkt.Subscriptions {
+		topic := sub.Topic
+		c.saveSubscription(topic, clientID)
+		c.subscribedTopics = append(c.subscribedTopics, topic)
+		log.Printf("[%s] SUBSCRIBE: id=%s, topic=%s, qos=%d", c.transport.Type(), formatClientID(clientID), topic, sub.QoS)
+		returnCodes = append(returnCodes, sub.QoS) // 요청된 QoS를 그대로 반환
 
-	if !c.sendSuback(subPkt.PacketID, clientID, topic) {
-		return false
+		// 구독 완료 후 보존 메시지 전송
+		c.sendRetainedMessages(topic)
 	}
 
-	// 구독 완료 후 보존 메시지 전송
-	c.sendRetainedMessage(topic)
+	if !c.sendSuback(subPkt.PacketID, clientID, returnCodes) {
+		return false
+	}
 
 	return true
 }
 
-func (c *BaseClient) sendRetainedMessage(topic string) {
-	payload, err := c.broker.store.GetRetainedMessage(topic)
+func (c *BaseClient) sendRetainedMessages(filter string) {
+	var messages []*mqtt.PublishPacket
+	var err error
+
+	if strings.Contains(filter, "+") || strings.Contains(filter, "#") {
+		// 와일드카드 구독
+		messages, err = c.broker.store.GetMatchingRetainedMessages(filter)
+	} else {
+		// 일반 구독
+		var payload []byte
+		payload, err = c.broker.store.GetRetainedMessage(filter)
+		if payload != nil {
+			messages = append(messages, &mqtt.PublishPacket{Topic: filter, Payload: payload, Retain: true})
+		}
+	}
+
 	if err != nil {
-		log.Printf("[%s] 보존 메시지 조회 실패: topic=%s, err=%v", c.transport.Type(), topic, err)
+		log.Printf("[%s] 보존 메시지 조회 실패: filter=%s, err=%v", c.transport.Type(), filter, err)
 		return
 	}
 
-	if payload != nil {
+	for _, msg := range messages {
 		log.Printf("[%s] 보존 메시지 전송: id=%s, topic=%s",
-			c.transport.Type(), formatClientID(c.id), topic)
-		// 명세에 따라, 보존 메시지를 보낼 땐 RETAIN 플래그를 1로 설정해야 함
-		c.SendPublish(topic, payload, true)
+			c.transport.Type(), formatClientID(c.id), msg.Topic)
+		c.SendPublish(msg.Topic, msg.Payload, true)
 	}
 }
 
@@ -323,11 +341,11 @@ func (c *BaseClient) saveSubscription(topic, clientID string) {
 	}
 }
 
-func (c *BaseClient) sendSuback(packetID uint16, clientID, topic string) bool {
-	err := mqtt.WriteSubackPacket(c.transport, packetID)
+func (c *BaseClient) sendSuback(packetID uint16, clientID string, returnCodes []byte) bool {
+	err := mqtt.WriteSubackPacket(c.transport, packetID, returnCodes)
 	if err != nil {
-		log.Printf("[%s] SUBACK 전송 실패: id=%s, topic=%s, err=%v",
-			c.transport.Type(), formatClientID(clientID), topic, err)
+		log.Printf("[%s] SUBACK 전송 실패: id=%s, err=%v",
+			c.transport.Type(), formatClientID(clientID), err)
 		return false
 	}
 	return true
@@ -349,11 +367,12 @@ func (c *BaseClient) handlePublish(header *mqtt.PacketHeader, clientID string) b
 	qos := (header.Flags >> 1) & 0x03
 	c.logPublish(clientID, pubPkt.Topic, pubPkt.Payload, qos, "수신")
 
+	// RETAIN 플래그가 true인 메시지는 구독자에게 전달하지 않음 (명세)
+	// 하지만 대부분의 브로커는 전달하므로, 여기서는 전달하는 것으로 유지
+	c.deliverMessageToSubscribers(clientID, pubPkt.Topic, pubPkt.Payload)
+
 	switch qos {
-	case 0:
-		c.deliverMessageToSubscribers(clientID, pubPkt.Topic, pubPkt.Payload)
 	case 1:
-		c.deliverMessageToSubscribers(clientID, pubPkt.Topic, pubPkt.Payload)
 		if !c.sendPuback(pubPkt.PacketID, clientID) {
 			return false
 		}
@@ -531,10 +550,16 @@ func (c *BaseClient) cleanupClient(clientID string) {
 func (c *BaseClient) deliverMessageToSubscribers(publisherID, topic string, payload []byte) {
 	subs := c.broker.store.GetSubscribers(topic)
 	if len(subs) == 0 {
-		log.Printf("[%s] 구독자 없음: topic=%s", c.transport.Type(), topic)
+		// log.Printf("[%s] 구독자 없음: topic=%s", c.transport.Type(), topic)
 		return
 	}
-	for _, subID := range subs {
+
+	uniqueSubs := make(map[string]struct{})
+	for _, sub := range subs {
+		uniqueSubs[sub] = struct{}{}
+	}
+
+	for subID := range uniqueSubs {
 		c.deliverMessageToSubscriber(publisherID, topic, payload, subID)
 	}
 }

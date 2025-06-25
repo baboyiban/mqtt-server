@@ -276,7 +276,7 @@ func (b *Broker) sendMessageToSubscriber(topic string, payload []byte, subscribe
 
 	if ok {
 		// 메시지 전송 시도
-		if !subClient.SendPublish(topic, payload) {
+		if !subClient.SendPublish(topic, payload, false) {
 			// 전송 실패 시 구독자 제거
 			b.removeSubscriber(topic, subscriberID)
 		}

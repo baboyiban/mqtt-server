@@ -28,6 +28,7 @@ type Store interface {
 	// 메시지 저장소 (옵션)
 	StoreRetainedMessage(topic string, payload []byte) error
 	GetRetainedMessage(topic string) ([]byte, error)
+	GetMatchingRetainedMessages(filter string) ([]*mqtt.PublishPacket, error)
 	RemoveRetainedMessage(topic string) error
 
 	// QoS 2 In-flight 메시지 관리
@@ -113,18 +114,48 @@ func (r *RedisStore) RemoveSubscriber(topic, clientID string) error {
 	return nil
 }
 
-// GetSubscribers는 토픽의 모든 구독자를 반환합니다
+// GetSubscribers는 특정 토픽에 대한 모든 구독자 (와일드카드 포함)를 반환합니다.
 func (r *RedisStore) GetSubscribers(topic string) []string {
-	key := r.getSubscriberKey(topic)
-	subs, err := r.client.SMembers(r.ctx, key).Result()
-	if err != nil {
-		log.Printf("[Redis] 구독자 조회 실패: topic=%s, err=%v", topic, err)
+	parts := strings.Split(topic, "/")
+	keys := []string{r.getSubscriberKey(topic), r.getSubscriberKey("#")}
+
+	for i := range parts {
+		// 멀티 레벨 와일드카드 (#) 키 생성
+		if i < len(parts) {
+			prefix := strings.Join(parts[:i], "/")
+			if prefix != "" {
+				prefix += "/"
+			}
+			keys = append(keys, r.getSubscriberKey(prefix+"#"))
+		}
+
+		// 싱글 레벨 와일드카드 (+) 키 생성
+		tempParts := make([]string, len(parts))
+		copy(tempParts, parts)
+		tempParts[i] = "+"
+		keys = append(keys, r.getSubscriberKey(strings.Join(tempParts, "/")))
+	}
+
+	// 중복 제거
+	keyMap := make(map[string]struct{})
+	uniqueKeys := []string{}
+	for _, k := range keys {
+		if _, exists := keyMap[k]; !exists {
+			keyMap[k] = struct{}{}
+			uniqueKeys = append(uniqueKeys, k)
+		}
+	}
+
+	if len(uniqueKeys) == 0 {
 		return nil
 	}
 
-	if len(subs) > 0 {
-		log.Printf("[Redis] 구독자 목록: topic=%s, count=%d, subs=%s",
-			topic, len(subs), strings.Join(subs, ","))
+	subs, err := r.client.SUnion(r.ctx, uniqueKeys...).Result()
+	if err != nil {
+		if err != redis.Nil {
+			log.Printf("[Redis] 구독자 조회 실패 (SUnion): topic=%s, err=%v", topic, err)
+		}
+		return nil
 	}
 
 	return subs
@@ -154,6 +185,34 @@ func (r *RedisStore) GetRetainedMessage(topic string) ([]byte, error) {
 		return nil, fmt.Errorf("메시지 조회 실패: %w", err)
 	}
 	return val, nil
+}
+
+// GetMatchingRetainedMessages는 와일드카드 필터와 일치하는 모든 보존 메시지를 반환합니다.
+func (r *RedisStore) GetMatchingRetainedMessages(filter string) ([]*mqtt.PublishPacket, error) {
+	var messages []*mqtt.PublishPacket
+	iter := r.client.Scan(r.ctx, 0, r.getRetainedKey("*"), 0).Iterator()
+
+	for iter.Next(r.ctx) {
+		key := iter.Val()
+		retainedTopic := strings.TrimPrefix(key, r.config.KeyPrefix+"retained:")
+
+		if Match(filter, retainedTopic) {
+			payload, err := r.client.Get(r.ctx, key).Bytes()
+			if err != nil {
+				log.Printf("[Redis] 보존 메시지 페이로드 조회 실패: key=%s, err=%v", key, err)
+				continue
+			}
+			messages = append(messages, &mqtt.PublishPacket{
+				Topic:   retainedTopic,
+				Payload: payload,
+				Retain:  true,
+			})
+		}
+	}
+	if err := iter.Err(); err != nil {
+		return nil, fmt.Errorf("retained 메시지 스캔 실패: %w", err)
+	}
+	return messages, nil
 }
 
 // RemoveRetainedMessage는 지정된 토픽의 retained 메시지를 제거합니다
@@ -258,4 +317,35 @@ func (r *RedisStore) getRetainedKey(topic string) string {
 
 func (r *RedisStore) getInflightKey(clientID string) string {
 	return r.config.KeyPrefix + "inflight:" + clientID
+}
+
+// Match는 MQTT 토픽 필터가 주어진 토픽과 일치하는지 확인합니다.
+func Match(filter, topic string) bool {
+	filterParts := strings.Split(filter, "/")
+	topicParts := strings.Split(topic, "/")
+
+	fLen := len(filterParts)
+	tLen := len(topicParts)
+
+	for i := 0; i < fLen; i++ {
+		if i >= tLen {
+			// 필터가 더 길지만 마지막 문자가 #가 아니면 불일치
+			return filterParts[i] == "#" && i == fLen-1
+		}
+
+		fPart := filterParts[i]
+		tPart := topicParts[i]
+
+		if fPart == "#" {
+			// #는 마지막이어야 함
+			return i == fLen-1
+		}
+
+		if fPart != "+" && fPart != tPart {
+			return false
+		}
+	}
+
+	// 필터와 토픽의 길이가 같으면 일치
+	return fLen == tLen
 }

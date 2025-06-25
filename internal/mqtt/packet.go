@@ -122,10 +122,16 @@ func ParseConnectPacket(r io.Reader, remLen int) (*ConnectPacket, error) {
 	return &ConnectPacket{ClientID: clientID}, nil
 }
 
+// TopicSubscription은 구독할 단일 토픽 필터와 QoS를 나타냅니다.
+type TopicSubscription struct {
+	Topic string
+	QoS   byte
+}
+
 // SubscribePacket은 MQTT SUBSCRIBE 패킷의 주요 필드를 나타냅니다.
 type SubscribePacket struct {
-	PacketID uint16
-	Topic    string
+	PacketID      uint16
+	Subscriptions []TopicSubscription
 }
 
 // ParseSubscribePacket은 SUBSCRIBE 패킷을 파싱합니다.
@@ -134,24 +140,43 @@ func ParseSubscribePacket(r io.Reader, remLen int) (*SubscribePacket, error) {
 	if _, err := io.ReadFull(r, buf); err != nil {
 		return nil, err
 	}
-	if len(buf) < 5 {
-		return nil, errors.New("SUBSCRIBE 패킷이 너무 짧음")
+	if len(buf) < 2 {
+		return nil, errors.New("SUBSCRIBE 패킷이 너무 짧음 (PacketID)")
 	}
+
 	packetID := uint16(buf[0])<<8 | uint16(buf[1])
-	topicLen := int(buf[2])<<8 | int(buf[3])
-	if len(buf) < 4+topicLen+1 {
-		return nil, errors.New("토픽 길이 오류")
+	var subscriptions []TopicSubscription
+	pos := 2
+
+	for pos < len(buf) {
+		if len(buf) < pos+2 {
+			return nil, errors.New("SUBSCRIBE 페이로드 파싱 오류 (토픽 길이)")
+		}
+		topicLen := int(buf[pos])<<8 | int(buf[pos+1])
+		pos += 2
+
+		if len(buf) < pos+topicLen+1 {
+			return nil, errors.New("SUBSCRIBE 페이로드 파싱 오류 (토픽 + QoS)")
+		}
+		topic := string(buf[pos : pos+topicLen])
+		pos += topicLen
+		qos := buf[pos]
+		pos++
+
+		subscriptions = append(subscriptions, TopicSubscription{Topic: topic, QoS: qos})
 	}
-	topic := string(buf[4 : 4+topicLen])
+
 	return &SubscribePacket{
-		PacketID: packetID,
-		Topic:    topic,
+		PacketID:      packetID,
+		Subscriptions: subscriptions,
 	}, nil
 }
 
 // WriteSubackPacket은 SUBACK 패킷을 작성합니다.
-func WriteSubackPacket(w io.Writer, packetID uint16) error {
-	packet := []byte{0x90, 0x03, byte(packetID >> 8), byte(packetID & 0xFF), 0x00}
+func WriteSubackPacket(w io.Writer, packetID uint16, returnCodes []byte) error {
+	remLen := 2 + len(returnCodes)
+	packet := []byte{0x90, byte(remLen), byte(packetID >> 8), byte(packetID & 0xFF)}
+	packet = append(packet, returnCodes...)
 	_, err := w.Write(packet)
 	return err
 }
