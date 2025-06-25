@@ -161,6 +161,7 @@ type PublishPacket struct {
 	Topic    string
 	Payload  []byte
 	PacketID uint16 // QoS > 0 일 때 사용
+	Retain   bool   // RETAIN 플래그
 }
 
 // ParsePublishPacket은 PUBLISH 패킷을 파싱합니다.
@@ -184,7 +185,8 @@ func ParsePublishPacket(r io.Reader, remLen int, headerFlags byte) (*PublishPack
 	pos += topicLen
 
 	pkt := &PublishPacket{
-		Topic: topic,
+		Topic:  topic,
+		Retain: (headerFlags & 0x01) == 1, // Retain 플래그 파싱
 	}
 
 	qos := (headerFlags >> 1) & 0x03
@@ -200,11 +202,18 @@ func ParsePublishPacket(r io.Reader, remLen int, headerFlags byte) (*PublishPack
 	return pkt, nil
 }
 
-// WritePublishPacket은 PUBLISH 패킷을 작성합니다.
-func WritePublishPacket(w io.Writer, topic string, payload []byte) error {
+// WritePublishPacket은 PUBLISH 패킷을 작성합니다. (retain 플래그 포함)
+func WritePublishPacket(w io.Writer, topic string, payload []byte, retain bool) error {
 	topicLen := len(topic)
 	remLen := 2 + topicLen + len(payload)
-	packet := []byte{0x30}
+
+	// 기본 패킷 타입은 0x30 (DUP=0, QoS=0, RETAIN=0)
+	packetType := byte(0x30)
+	if retain {
+		packetType |= 0x01 // RETAIN 플래그 설정
+	}
+
+	packet := []byte{packetType}
 	packet = append(packet, encodeRemainingLength(remLen)...)
 	packet = append(packet, byte(topicLen>>8), byte(topicLen&0xFF))
 	packet = append(packet, []byte(topic)...)

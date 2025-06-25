@@ -24,7 +24,7 @@ type ClientTransport interface {
 // Clienter 인터페이스: 모든 클라이언트 공통 동작
 type Clienter interface {
 	Handle()
-	SendPublish(topic string, payload []byte) bool
+	SendPublish(topic string, payload []byte, retain bool) bool // retain 플래그 추가
 	GetID() string
 	GetTransport() ClientTransport
 }
@@ -126,8 +126,8 @@ func (c *BaseClient) GetTransport() ClientTransport {
 }
 
 // 공통 publish 기능
-func (c *BaseClient) SendPublish(topic string, payload []byte) bool {
-	err := mqtt.WritePublishPacket(c.transport, topic, payload)
+func (c *BaseClient) SendPublish(topic string, payload []byte, retain bool) bool {
+	err := mqtt.WritePublishPacket(c.transport, topic, payload, retain)
 	if err != nil {
 		log.Printf("[%s] 메시지 전송 실패: id=%s, topic=%s, err=%v",
 			c.transport.Type(), formatClientID(c.id), topic, err)
@@ -274,10 +274,35 @@ func (c *BaseClient) handleSubscribe(header *mqtt.PacketHeader, clientID string)
 	if err != nil {
 		return false
 	}
-	c.saveSubscription(subPkt.Topic, clientID)
-	c.subscribedTopics = append(c.subscribedTopics, subPkt.Topic)
-	log.Printf("[%s] SUBSCRIBE: id=%s, topic=%s", c.transport.Type(), formatClientID(clientID), subPkt.Topic)
-	return c.sendSuback(subPkt.PacketID, clientID, subPkt.Topic)
+
+	topic := subPkt.Topic
+	c.saveSubscription(topic, clientID)
+	c.subscribedTopics = append(c.subscribedTopics, topic)
+	log.Printf("[%s] SUBSCRIBE: id=%s, topic=%s", c.transport.Type(), formatClientID(clientID), topic)
+
+	if !c.sendSuback(subPkt.PacketID, clientID, topic) {
+		return false
+	}
+
+	// 구독 완료 후 보존 메시지 전송
+	c.sendRetainedMessage(topic)
+
+	return true
+}
+
+func (c *BaseClient) sendRetainedMessage(topic string) {
+	payload, err := c.broker.store.GetRetainedMessage(topic)
+	if err != nil {
+		log.Printf("[%s] 보존 메시지 조회 실패: topic=%s, err=%v", c.transport.Type(), topic, err)
+		return
+	}
+
+	if payload != nil {
+		log.Printf("[%s] 보존 메시지 전송: id=%s, topic=%s",
+			c.transport.Type(), formatClientID(c.id), topic)
+		// 명세에 따라, 보존 메시지를 보낼 땐 RETAIN 플래그를 1로 설정해야 함
+		c.SendPublish(topic, payload, true)
+	}
 }
 
 func (c *BaseClient) parseSubscribePacket(header *mqtt.PacketHeader) (*mqtt.SubscribePacket, error) {
@@ -316,6 +341,11 @@ func (c *BaseClient) handlePublish(header *mqtt.PacketHeader, clientID string) b
 		return false
 	}
 
+	// 보존 메시지 처리
+	if pubPkt.Retain {
+		c.handleRetain(pubPkt)
+	}
+
 	qos := (header.Flags >> 1) & 0x03
 	c.logPublish(clientID, pubPkt.Topic, pubPkt.Payload, qos, "수신")
 
@@ -345,6 +375,29 @@ func (c *BaseClient) handlePublish(header *mqtt.PacketHeader, clientID string) b
 		}
 	}
 	return true
+}
+
+func (c *BaseClient) handleRetain(pubPkt *mqtt.PublishPacket) {
+	topic := pubPkt.Topic
+	payload := pubPkt.Payload
+
+	if len(payload) == 0 {
+		// 페이로드가 0바이트이면 보존 메시지 삭제
+		err := c.broker.store.RemoveRetainedMessage(topic)
+		if err != nil {
+			log.Printf("[%s] 보존 메시지 삭제 실패: topic=%s, err=%v", c.transport.Type(), topic, err)
+		} else {
+			log.Printf("[%s] 보존 메시지 삭제됨: topic=%s", c.transport.Type(), topic)
+		}
+	} else {
+		// 페이로드가 있으면 보존 메시지 저장
+		err := c.broker.store.StoreRetainedMessage(topic, payload)
+		if err != nil {
+			log.Printf("[%s] 보존 메시지 저장 실패: topic=%s, err=%v", c.transport.Type(), topic, err)
+		} else {
+			log.Printf("[%s] 보존 메시지 저장됨: topic=%s", c.transport.Type(), topic)
+		}
+	}
 }
 
 func (c *BaseClient) handlePubrel(header *mqtt.PacketHeader, clientID string) bool {
@@ -497,7 +550,8 @@ func (c *BaseClient) deliverMessageToSubscriber(publisherID, topic string, paylo
 		log.Printf("[%s] 메시지 전달: from=%s, to=%s, topic=%s",
 			transportType, formatClientID(publisherID), formatClientID(subID), topic)
 
-		if !subClient.SendPublish(topic, payload) {
+		// 메시지를 전달할 때는 RETAIN 플래그를 false로 설정
+		if !subClient.SendPublish(topic, payload, false) {
 			log.Printf("[%s] 구독자 연결 끊김, 제거: id=%s, topic=%s",
 				transportType, formatClientID(subID), topic)
 			c.removeClientAndSubscriptions(subID, topic)
