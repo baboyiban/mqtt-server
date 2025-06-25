@@ -2,6 +2,7 @@ package mqtt
 
 import (
 	"errors"
+	"fmt"
 	"io"
 )
 
@@ -9,10 +10,14 @@ const (
 	PacketTypeCONNECT    = 1
 	PacketTypeCONNACK    = 2
 	PacketTypePUBLISH    = 3
+	PacketTypePUBACK     = 4
+	PacketTypePUBREC     = 5 // Publish Received
+	PacketTypePUBREL     = 6 // Publish Release
+	PacketTypePUBCOMP    = 7 // Publish Complete
 	PacketTypeSUBSCRIBE  = 8
 	PacketTypeSUBACK     = 9
-	PacketTypePINGREQ    = 12 // Add this
-	PacketTypePINGRESP   = 13 // Add this
+	PacketTypePINGREQ    = 12
+	PacketTypePINGRESP   = 13
 	PacketTypeDISCONNECT = 14
 )
 
@@ -27,6 +32,24 @@ type PacketHeader struct {
 	Type   byte
 	Flags  byte
 	RemLen int
+}
+
+// PacketWithID는 PUBACK, PUBREC, PUBREL, PUBCOMP 같이 Packet ID만 포함하는 패킷을 나타냅니다.
+type PacketWithID struct {
+	PacketID uint16
+}
+
+// ParsePacketWithID는 Packet ID만 포함하는 패킷을 파싱합니다.
+func ParsePacketWithID(r io.Reader, remLen int) (*PacketWithID, error) {
+	if remLen != 2 {
+		return nil, fmt.Errorf("패킷 ID를 포함한 패킷의 길이가 유효하지 않음: %d", remLen)
+	}
+	buf := make([]byte, 2)
+	if _, err := io.ReadFull(r, buf); err != nil {
+		return nil, err
+	}
+	packetID := uint16(buf[0])<<8 | uint16(buf[1])
+	return &PacketWithID{PacketID: packetID}, nil
 }
 
 func ReadPacketHeader(r io.Reader) (*PacketHeader, error) {
@@ -135,12 +158,13 @@ func WriteSubackPacket(w io.Writer, packetID uint16) error {
 
 // PublishPacket은 MQTT PUBLISH 패킷의 주요 필드를 나타냅니다.
 type PublishPacket struct {
-	Topic   string
-	Payload []byte
+	Topic    string
+	Payload  []byte
+	PacketID uint16 // QoS > 0 일 때 사용
 }
 
 // ParsePublishPacket은 PUBLISH 패킷을 파싱합니다.
-func ParsePublishPacket(r io.Reader, remLen int) (*PublishPacket, error) {
+func ParsePublishPacket(r io.Reader, remLen int, headerFlags byte) (*PublishPacket, error) {
 	buf := make([]byte, remLen)
 	if _, err := io.ReadFull(r, buf); err != nil {
 		return nil, err
@@ -148,16 +172,32 @@ func ParsePublishPacket(r io.Reader, remLen int) (*PublishPacket, error) {
 	if len(buf) < 2 {
 		return nil, errors.New("PUBLISH 패킷이 너무 짧음")
 	}
-	topicLen := int(buf[0])<<8 | int(buf[1])
-	if len(buf) < 2+topicLen {
+
+	pos := 0
+	topicLen := int(buf[pos])<<8 | int(buf[pos+1])
+	pos += 2
+
+	if len(buf) < pos+topicLen {
 		return nil, errors.New("토픽 길이 오류")
 	}
-	topic := string(buf[2 : 2+topicLen])
-	payload := buf[2+topicLen:]
-	return &PublishPacket{
-		Topic:   topic,
-		Payload: payload,
-	}, nil
+	topic := string(buf[pos : pos+topicLen])
+	pos += topicLen
+
+	pkt := &PublishPacket{
+		Topic: topic,
+	}
+
+	qos := (headerFlags >> 1) & 0x03
+	if qos > 0 {
+		if len(buf) < pos+2 {
+			return nil, errors.New("PUBLISH 패킷이 너무 짧음 (Packet ID 없음)")
+		}
+		pkt.PacketID = uint16(buf[pos])<<8 | uint16(buf[pos+1])
+		pos += 2
+	}
+
+	pkt.Payload = buf[pos:]
+	return pkt, nil
 }
 
 // WritePublishPacket은 PUBLISH 패킷을 작성합니다.
@@ -176,6 +216,32 @@ func WritePublishPacket(w io.Writer, topic string, payload []byte) error {
 // WriteConnackPacket은 CONNACK 패킷을 작성합니다.
 func WriteConnackPacket(w io.Writer) error {
 	packet := []byte{0x20, 0x02, 0x00, 0x00}
+	_, err := w.Write(packet)
+	return err
+}
+
+// WritePubackPacket은 PUBACK 패킷을 작성합니다.
+func WritePubackPacket(w io.Writer, packetID uint16) error {
+	packet := []byte{
+		byte(PacketTypePUBACK << 4), // Packet Type: PUBACK (4)
+		2,                           // Remaining Length
+		byte(packetID >> 8),         // Packet ID MSB
+		byte(packetID & 0xFF),       // Packet ID LSB
+	}
+	_, err := w.Write(packet)
+	return err
+}
+
+// WritePubrecPacket은 PUBREC 패킷을 작성합니다.
+func WritePubrecPacket(w io.Writer, packetID uint16) error {
+	packet := []byte{byte(PacketTypePUBREC << 4), 2, byte(packetID >> 8), byte(packetID & 0xFF)}
+	_, err := w.Write(packet)
+	return err
+}
+
+// WritePubcompPacket은 PUBCOMP 패킷을 작성합니다.
+func WritePubcompPacket(w io.Writer, packetID uint16) error {
+	packet := []byte{byte(PacketTypePUBCOMP << 4), 2, byte(packetID >> 8), byte(packetID & 0xFF)}
 	_, err := w.Write(packet)
 	return err
 }

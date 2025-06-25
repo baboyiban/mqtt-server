@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/baboyiban/mqtt-server/internal/mqtt"
@@ -94,21 +95,25 @@ type BaseClient struct {
 	broker           *Broker
 	id               string
 	subscribedTopics []string
+	inflightMessages map[uint16]*mqtt.PublishPacket // QoS 2 메시지 상태 추적용
+	mu               sync.Mutex                     // inflightMessages 보호용 뮤텍스
 }
 
 // NewClient는 TCP 클라이언트를 생성합니다
 func NewClient(conn net.Conn, broker *Broker) Clienter {
 	return &BaseClient{
-		transport: NewTCPTransport(conn),
-		broker:    broker,
+		transport:        NewTCPTransport(conn),
+		broker:           broker,
+		inflightMessages: make(map[uint16]*mqtt.PublishPacket),
 	}
 }
 
 // NewWSClient는 WebSocket 클라이언트를 생성합니다
 func NewWSClient(conn *websocket.Conn, broker *Broker) Clienter {
 	return &BaseClient{
-		transport: NewWSTransport(conn),
-		broker:    broker,
+		transport:        NewWSTransport(conn),
+		broker:           broker,
+		inflightMessages: make(map[uint16]*mqtt.PublishPacket),
 	}
 }
 
@@ -169,6 +174,10 @@ func (c *BaseClient) handlePacket(header *mqtt.PacketHeader, clientID *string) (
 		if !c.handlePublish(header, *clientID) {
 			return true
 		}
+	case mqtt.PacketTypePUBREL:
+		if !c.handlePubrel(header, *clientID) {
+			return true
+		}
 	case mqtt.PacketTypePINGREQ:
 		if !c.handlePingReq(*clientID) {
 			return true
@@ -196,11 +205,32 @@ func (c *BaseClient) handleConnect(header *mqtt.PacketHeader) string {
 		return ""
 	}
 	clientID := c.assignClientID(connectPkt.ClientID)
+
+	// Redis에서 진행 중이던 메시지 상태 로드
+	c.loadInflightMessages(clientID)
+
 	c.registerClient(clientID)
 	if !c.sendConnack(clientID) {
 		return ""
 	}
 	return clientID
+}
+
+func (c *BaseClient) loadInflightMessages(clientID string) {
+	messages, err := c.broker.store.GetAllInflightMessages(clientID)
+	if err != nil {
+		log.Printf("[%s] In-flight 메시지 로드 실패: id=%s, err=%v",
+			c.transport.Type(), formatClientID(clientID), err)
+		return
+	}
+
+	if len(messages) > 0 {
+		c.mu.Lock()
+		c.inflightMessages = messages
+		c.mu.Unlock()
+		log.Printf("[%s] In-flight 메시지 %d개 로드 완료: id=%s",
+			c.transport.Type(), len(messages), formatClientID(clientID))
+	}
 }
 
 func (c *BaseClient) parseConnectPacket(header *mqtt.PacketHeader) (*mqtt.ConnectPacket, error) {
@@ -285,13 +315,85 @@ func (c *BaseClient) handlePublish(header *mqtt.PacketHeader, clientID string) b
 	if err != nil {
 		return false
 	}
-	c.logPublish(clientID, pubPkt.Topic, pubPkt.Payload)
-	c.deliverMessageToSubscribers(clientID, pubPkt.Topic, pubPkt.Payload)
+
+	qos := (header.Flags >> 1) & 0x03
+	c.logPublish(clientID, pubPkt.Topic, pubPkt.Payload, qos, "수신")
+
+	switch qos {
+	case 0:
+		c.deliverMessageToSubscribers(clientID, pubPkt.Topic, pubPkt.Payload)
+	case 1:
+		c.deliverMessageToSubscribers(clientID, pubPkt.Topic, pubPkt.Payload)
+		if !c.sendPuback(pubPkt.PacketID, clientID) {
+			return false
+		}
+	case 2:
+		// 메시지를 Redis에 먼저 저장
+		if err := c.broker.store.StoreInflightMessage(clientID, pubPkt); err != nil {
+			log.Printf("[%s] In-flight 메시지 저장 실패: id=%s, packetID=%d, err=%v",
+				c.transport.Type(), formatClientID(clientID), pubPkt.PacketID, err)
+			return false // 영구 저장 실패 시 핸드셰이크를 진행하지 않음
+		}
+
+		// 로컬 캐시에도 업데이트
+		c.mu.Lock()
+		c.inflightMessages[pubPkt.PacketID] = pubPkt
+		c.mu.Unlock()
+
+		if !c.sendPubrec(pubPkt.PacketID, clientID) {
+			return false
+		}
+	}
+	return true
+}
+
+func (c *BaseClient) handlePubrel(header *mqtt.PacketHeader, clientID string) bool {
+	// MQTT v3.1.1 명세에 따라 PUBREL의 고정 헤더 플래그는 0010이어야 합니다.
+	if header.Flags != 2 {
+		log.Printf("[%s] 잘못된 PUBREL 패킷(flags!=2): id=%s", c.transport.Type(), formatClientID(clientID))
+		return false // 연결 종료
+	}
+
+	pubrelPkt, err := mqtt.ParsePacketWithID(c.transport, header.RemLen)
+	if err != nil {
+		log.Printf("[%s] PUBREL 파싱 실패: id=%s, err=%v", c.transport.Type(), formatClientID(clientID), err)
+		return false
+	}
+
+	// 로컬 캐시에서 메시지 확인
+	c.mu.Lock()
+	pubPkt, ok := c.inflightMessages[pubrelPkt.PacketID]
+	if ok {
+		delete(c.inflightMessages, pubrelPkt.PacketID)
+	}
+	c.mu.Unlock()
+
+	// Redis에서도 메시지 삭제
+	if err := c.broker.store.RemoveInflightMessage(clientID, pubrelPkt.PacketID); err != nil {
+		log.Printf("[%s] In-flight 메시지 삭제 실패 (Redis): id=%s, packetID=%d, err=%v",
+			c.transport.Type(), formatClientID(clientID), pubrelPkt.PacketID, err)
+		// Redis에서 삭제 실패해도 일단 진행 (서버 재시작 시 중복 전달 가능성 있음)
+	}
+
+	if !ok {
+		log.Printf("[%s] 알 수 없는 PacketID에 대한 PUBREL 수신: id=%s, packetID=%d",
+			c.transport.Type(), formatClientID(clientID), pubrelPkt.PacketID)
+	} else {
+		// PUBREL을 받았으므로, 이제 메시지를 구독자에게 전달합니다.
+		c.logPublish(clientID, pubPkt.Topic, pubPkt.Payload, 2, "전달")
+		c.deliverMessageToSubscribers(clientID, pubPkt.Topic, pubPkt.Payload)
+	}
+
+	// PUBREL에 대한 응답으로 항상 PUBCOMP를 보냅니다.
+	if !c.sendPubcomp(pubrelPkt.PacketID, clientID) {
+		return false
+	}
 	return true
 }
 
 func (c *BaseClient) parsePublishPacket(header *mqtt.PacketHeader) (*mqtt.PublishPacket, error) {
-	pubPkt, err := mqtt.ParsePublishPacket(c.transport, header.RemLen)
+	// 파서에 header.Flags 전달
+	pubPkt, err := mqtt.ParsePublishPacket(c.transport, header.RemLen, header.Flags)
 	if err != nil {
 		log.Printf("[%s] PUBLISH 파싱 실패: id=%s, err=%v",
 			c.transport.Type(), formatClientID(c.id), err)
@@ -300,9 +402,39 @@ func (c *BaseClient) parsePublishPacket(header *mqtt.PacketHeader) (*mqtt.Publis
 	return pubPkt, nil
 }
 
-func (c *BaseClient) logPublish(clientID, topic string, payload []byte) {
-	log.Printf("[%s] PUBLISH: id=%s, topic=%s, payload=%s",
-		c.transport.Type(), formatClientID(clientID), topic, string(payload))
+func (c *BaseClient) logPublish(clientID, topic string, payload []byte, qos byte, context string) {
+	log.Printf("[%s] PUBLISH [%s]: id=%s, topic=%s, qos=%d, payload=%s",
+		c.transport.Type(), context, formatClientID(clientID), topic, qos, string(payload))
+}
+
+func (c *BaseClient) sendPuback(packetID uint16, clientID string) bool {
+	err := mqtt.WritePubackPacket(c.transport, packetID)
+	if err != nil {
+		log.Printf("[%s] PUBACK 전송 실패: id=%s, packetID=%d, err=%v",
+			c.transport.Type(), formatClientID(clientID), packetID, err)
+		return false
+	}
+	return true
+}
+
+func (c *BaseClient) sendPubrec(packetID uint16, clientID string) bool {
+	err := mqtt.WritePubrecPacket(c.transport, packetID)
+	if err != nil {
+		log.Printf("[%s] PUBREC 전송 실패: id=%s, packetID=%d, err=%v",
+			c.transport.Type(), formatClientID(clientID), packetID, err)
+		return false
+	}
+	return true
+}
+
+func (c *BaseClient) sendPubcomp(packetID uint16, clientID string) bool {
+	err := mqtt.WritePubcompPacket(c.transport, packetID)
+	if err != nil {
+		log.Printf("[%s] PUBCOMP 전송 실패: id=%s, packetID=%d, err=%v",
+			c.transport.Type(), formatClientID(clientID), packetID, err)
+		return false
+	}
+	return true
 }
 
 // --- 이하 기존 함수 동일 ---
